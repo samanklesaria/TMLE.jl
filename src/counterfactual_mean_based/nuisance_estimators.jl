@@ -158,13 +158,17 @@ function estimate_outcome_mean(outcome_mean, models, dataset;
     verbosity=1,
     machine_cache=false,
     acceleration=CPU1(),
-    prevalence_weights=nothing
+    prevalence_weights=nothing,
+    censoring_score=nothing
     )
     outcome_model = acquire_model(models, outcome_mean.outcome, dataset)
+    # Under IPCW the outcome model only sees uncensored rows: weight them by the inverse
+    # probability of being uncensored so the fit targets the full population.
     outcome_mean_estimator = ConditionalDistributionEstimator(
         outcome_model,
         train_validation_indices,
-        prevalence_weights=prevalence_weights
+        prevalence_weights=prevalence_weights,
+        censoring_score=censoring_score
     )
     return try_fit_ml_estimator(outcome_mean_estimator, outcome_mean, dataset;
         error_fn=outcome_mean_fit_error_msg,
@@ -185,7 +189,8 @@ function estimate_propensity_score_and_outcome_mean(
     cache=Dict(), 
     verbosity=1, 
     machine_cache=false,
-    prevalence_weights=nothing
+    prevalence_weights=nothing,
+    censoring_score=nothing
     )
     propensity_score_estimate = estimate_propensity_score(propensity_score, models, dataset;
         train_validation_indices=train_validation_indices,
@@ -200,7 +205,8 @@ function estimate_propensity_score_and_outcome_mean(
         cache=cache,
         verbosity=verbosity,
         machine_cache=machine_cache,
-        prevalence_weights=prevalence_weights
+        prevalence_weights=prevalence_weights,
+        censoring_score=censoring_score
     )
     return (propensity_score_estimate, outcome_mean_estimate)
 end
@@ -215,7 +221,8 @@ function estimate_propensity_score_and_outcome_mean(
     cache=Dict(), 
     verbosity=1, 
     machine_cache=false,
-    prevalence_weights=nothing
+    prevalence_weights=nothing,
+    censoring_score=nothing
     )
     propensity_score_estimate = @spawn estimate_propensity_score(propensity_score, models, dataset;
         train_validation_indices=train_validation_indices,
@@ -231,7 +238,8 @@ function estimate_propensity_score_and_outcome_mean(
         cache=cache,
         verbosity=verbosity,
         machine_cache=machine_cache,
-        prevalence_weights=prevalence_weights
+        prevalence_weights=prevalence_weights,
+        censoring_score=censoring_score
     )
     return fetch.([propensity_score_estimate, outcome_mean_estimate])
 end
@@ -273,6 +281,17 @@ function (estimator::CMRelevantFactorsEstimator)(estimand, dataset;
     train_validation_indices = estimator.train_validation_indices
     prevalence_weights = estimator.prevalence_weights
     
+    # Estimate the censoring score first: the outcome mean is fit on uncensored rows only and
+    # needs the censoring weights (no prevalence_weights here: the censoring model should not be
+    # reweighted by case-control prevalence).
+    censoring_score_estimate = estimate_censoring_score(
+        estimand.censoring_score, models, dataset;
+        train_validation_indices=train_validation_indices,
+        cache=cache,
+        verbosity=verbosity,
+        machine_cache=machine_cache
+    )
+
     # Estimate propensity score and outcome mean
     propensity_score_estimate, outcome_mean_estimate = estimate_propensity_score_and_outcome_mean(
         acceleration,
@@ -284,17 +303,8 @@ function (estimator::CMRelevantFactorsEstimator)(estimand, dataset;
         cache=cache,
         verbosity=verbosity,
         machine_cache=machine_cache,
-        prevalence_weights=prevalence_weights
-    )
-
-    # Estimate censoring score if needed (no prevalence_weights: censoring
-    # model should not be reweighted by case-control prevalence)
-    censoring_score_estimate = estimate_censoring_score(
-        estimand.censoring_score, models, dataset;
-        train_validation_indices=train_validation_indices,
-        cache=cache,
-        verbosity=verbosity,
-        machine_cache=machine_cache
+        prevalence_weights=prevalence_weights,
+        censoring_score=censoring_score_estimate
     )
 
     # Build estimate

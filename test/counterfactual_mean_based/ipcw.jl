@@ -12,6 +12,21 @@ using TMLE
 
 include(joinpath(dirname(dirname(pathof(TMLE))), "test", "helper_fns.jl"))
 
+"""
+    test_ipcw_fixes_bias(build_estimator, Ψ, dataset, Ψ₀)
+
+When the missingness is informative, the complete case analysis (`ipcw=false`, censored rows
+simply dropped) is biased: its confidence interval misses the truth entirely. The IPCW estimator
+recovers it on the very same dataset. `build_estimator(ipcw)` returns the estimator to run.
+"""
+function test_ipcw_fixes_bias(build_estimator, Ψ, dataset, Ψ₀)
+    classic, _ = build_estimator(false)(Ψ, dataset; verbosity=0)
+    lb, ub = confint(significance_test(classic))
+    @test !(lb ≤ Ψ₀ ≤ ub)
+    corrected, _ = build_estimator(true)(Ψ, dataset; verbosity=0)
+    test_coverage(corrected, Ψ₀)
+end
+
 @testset "Censoring indicator utilities" begin
     # Test censoring_indicator_name
     @test TMLE.censoring_indicator_name(:Y) == :Δ_Y
@@ -41,13 +56,19 @@ end
 """
 Generate a continuous outcome ATE problem with MAR missingness.
 Missingness depends on W (confounders) creating a MAR pattern.
+
+With `effect_modification=0` the effect is homogeneous and the missingness is ignorable for the
+outcome model, so the complete case analysis is already consistent. Setting it non zero makes the
+effect W dependent: dropping the censored rows then shifts the W distribution the counterfactual
+means are averaged over, which biases the complete case analysis. The ATE stays 2 either way
+since E[W] = 0.
 """
-function ate_with_mar_missingness(;n=2000)
+function ate_with_mar_missingness(;n=2000, effect_modification=0.)
     rng = StableRNG(42)
     W = randn(rng, n)
     T = rand(rng, n) .< LogExpFunctions.logistic.(0.5 .* W)
     # True ATE = 2
-    Y = 2.0 .* T .+ W .+ 0.5 .* randn(rng, n)
+    Y = 2.0 .* T .+ W .+ effect_modification .* T .* W .+ 0.5 .* randn(rng, n)
     ATE_true = 2.0
 
     dataset = DataFrame(
@@ -79,33 +100,53 @@ end
     tmle = Tmle()
     result, _ = tmle(Ψ, dataset; verbosity=0)
     test_coverage(result, ATE_true)
+
+    # The effect is homogeneous and the missingness depends only on W, which the outcome model
+    # adjusts for, so the complete case analysis is consistent here too. IPCW must not break it.
+    result, _ = Tmle(ipcw=false)(Ψ, dataset; verbosity=0)
+    test_coverage(result, ATE_true)
+    result, _ = Ose(ipcw=false)(Ψ, dataset; verbosity=0)
+    test_coverage(result, ATE_true)
+end
+
+@testset "Complete case is biased, IPCW is not: MAR missingness with effect modification" begin
+    dataset, ATE_true = ate_with_mar_missingness(n=5000, effect_modification=2.5)
+    Ψ = ATE(
+        outcome=:Y,
+        treatment_values=(T=(case=1, control=0),),
+        treatment_confounders=(T=[:W],)
+    )
+    test_ipcw_fixes_bias(ipcw -> Tmle(ipcw=ipcw), Ψ, dataset, ATE_true)
+    test_ipcw_fixes_bias(ipcw -> Ose(ipcw=ipcw), Ψ, dataset, ATE_true)
 end
 
 """
-Generate a continuous outcome ATE problem with MAR missing *outcomes* AND some missing
-*covariates*. Both W₁ and W₂ confound; W₂ is missing at random in a fraction of rows.
+Generate a continuous outcome ATE problem with MAR missing *outcomes* AND MCAR missing
+*covariates*. Only the former is corrected by IPCW; the latter exists to make the nuisance
+fitting rows and the fluctuation rows two different row spaces, which is what exercises the
+`align_to_rows` CV fold realignment.
 """
 function ate_with_missing_covariates(;n=5000)
     rng = StableRNG(42)
-    W₁ = randn(rng, n)
-    W₂ = randn(rng, n)
-    T = rand(rng, n) .< LogExpFunctions.logistic.(0.5 .* W₁ .+ 0.3 .* W₂)
-    Y = 2.0 .* T .+ W₁ .+ W₂ .+ 0.5 .* randn(rng, n)
+    W = randn(rng, n)
+    T = rand(rng, n) .< LogExpFunctions.logistic.(0.5 .* W)
+    # Heterogeneous effect: 2 + 2.5W, so the ATE is 2 since E[W] = 0.
+    Y = 2.0 .* T .+ W .+ 2.5 .* T .* W .+ 0.5 .* randn(rng, n)
     ATE_true = 2.0
 
     dataset = DataFrame(
-        W₁ = W₁,
-        W₂ = Vector{Union{Missing, Float64}}(W₂),
+        W = Vector{Union{Missing, Float64}}(W),
         T = categorical(Int.(T)),
         Y = Vector{Union{Missing, Float64}}(Y)
     )
-    # MAR missing outcomes (depend on W₁)
-    p_missing_Y = LogExpFunctions.logistic.(-1.0 .+ 0.8 .* W₁)
-    # Missing covariate W₂ (depend on W₁, independent of the Y-missingness draw)
-    p_missing_W₂ = LogExpFunctions.logistic.(-1.5 .+ 0.5 .* W₁)
+    # MAR missing outcomes (depend on W), handled by IPCW.
+    p_missing_Y = LogExpFunctions.logistic.(-1.0 .+ 0.8 .* W)
     for i in 1:n
         rand(rng) < p_missing_Y[i] && (dataset.Y[i] = missing)
-        rand(rng) < p_missing_W₂[i] && (dataset.W₂[i] = missing)
+        # MCAR missing covariate: nothing corrects for it, so the complete case deletion it
+        # triggers must be innocuous for the test to mean anything. The retained rows keep the
+        # same W distribution, hence the same ATE even though the effect is heterogeneous.
+        rand(rng) < 0.25 && (dataset.W[i] = missing)
     end
     return dataset, ATE_true
 end
@@ -115,11 +156,9 @@ end
     Ψ = ATE(
         outcome=:Y,
         treatment_values=(T=(case=1, control=0),),
-        treatment_confounders=(T=[:W₁, :W₂],)
+        treatment_confounders=(T=[:W],)
     )
-    tmle = Tmle(resampling=CV(nfolds=3))
-    result, _ = tmle(Ψ, dataset; verbosity=0)
-    test_coverage(result, ATE_true)
+    test_ipcw_fixes_bias(ipcw -> Tmle(resampling=CV(nfolds=3), ipcw=ipcw), Ψ, dataset, ATE_true)
 end
 
 @testset "CV-IPCW OSE with missing covariates" begin
@@ -127,11 +166,9 @@ end
     Ψ = ATE(
         outcome=:Y,
         treatment_values=(T=(case=1, control=0),),
-        treatment_confounders=(T=[:W₁, :W₂],)
+        treatment_confounders=(T=[:W],)
     )
-    ose = Ose(resampling=CV(nfolds=3))
-    result, _ = ose(Ψ, dataset; verbosity=0)
-    test_coverage(result, ATE_true)
+    test_ipcw_fixes_bias(ipcw -> Ose(resampling=CV(nfolds=3), ipcw=ipcw), Ψ, dataset, ATE_true)
 end
 
 function ate_with_treatment_dependent_missingness(;n=8000)
@@ -150,22 +187,18 @@ function ate_with_treatment_dependent_missingness(;n=8000)
     return dataset, 2.0
 end
 
-@testset "Complete-case analysis is biased, IPCW is not" begin
+@testset "Complete case is biased, IPCW is not: treatment dependent missingness" begin
     dataset, ATE_true = ate_with_treatment_dependent_missingness()
     Ψ = ATE(
         outcome=:Y,
         treatment_values=(T=(case=1, control=0),),
         treatment_confounders=(T=[:W],)
     )
-    # Classic estimator: drop the censored rows, no censoring model at all.
+    test_ipcw_fixes_bias(ipcw -> Tmle(ipcw=ipcw), Ψ, dataset, ATE_true)
+    test_ipcw_fixes_bias(ipcw -> Ose(ipcw=ipcw), Ψ, dataset, ATE_true)
+    # Severe downward bias, not a borderline miss: the truth is 2.
     classic, _ = Tmle(ipcw=false)(Ψ, dataset; verbosity=0)
-    lb, ub = confint(OneSampleTTest(classic))
-    @test !(lb ≤ ATE_true ≤ ub)      # CI misses the truth entirely
-    @test TMLE.estimate(classic) < 1 # severe downward bias (truth is 2)
-
-    # IPCW estimator on the very same dataset, censored rows included.
-    ipcw, _ = Tmle()(Ψ, dataset; verbosity=0)
-    test_coverage(ipcw, ATE_true)
+    @test TMLE.estimate(classic) < 1
 end
 
 end

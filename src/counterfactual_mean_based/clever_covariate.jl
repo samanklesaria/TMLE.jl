@@ -21,8 +21,8 @@ end
 """
     balancing_weights(G::NamedTuple, dataset; ps_lowerbound=1e-8)
 
-G always carries a `propensity_score` and a (possibly `nothing`) `censoring_score`. When the
-latter is present, the inverse probability of censoring weights are folded in.
+Inverse probability of treatment weights. The censoring weights are *not* folded in here: they
+multiply the fluctuation weights instead (see `clever_covariate_and_weights`).
 """
 function balancing_weights(G::NamedTuple, dataset; ps_lowerbound=1e-8)
     jointlikelihood = ones(nrows(dataset))
@@ -30,10 +30,7 @@ function balancing_weights(G::NamedTuple, dataset; ps_lowerbound=1e-8)
         jointlikelihood .*= likelihood(Gᵢ, dataset)
     end
     truncate!(jointlikelihood, ps_lowerbound)
-    weights = 1. ./ jointlikelihood
-    ipcw = compute_ipcw_weights(G.censoring_score, dataset; ps_lowerbound=ps_lowerbound)
-    ipcw === nothing || (weights .*= ipcw)
-    return weights
+    return 1. ./ jointlikelihood
 end
 
 """
@@ -70,10 +67,12 @@ function clever_covariate_and_weights(
     T = selectcols(dataset, (p.estimand.outcome for p in G.propensity_score.components))
     indic_vals = indicator_values(indicator_fns(Ψ), T)
     weights = balancing_weights(G, dataset; ps_lowerbound=ps_lowerbound)
+    ipcw = compute_ipcw_weights(G.censoring_score, dataset; ps_lowerbound=ps_lowerbound)
     if weighted_fluctuation
+        ipcw === nothing || (weights .*= ipcw)
         return indic_vals, weights
     end
     # Vanilla unweighted fluctuation
     indic_vals .*= weights
-    return indic_vals, ones(size(weights, 1))
+    return indic_vals, ipcw === nothing ? ones(size(weights, 1)) : ipcw
 end

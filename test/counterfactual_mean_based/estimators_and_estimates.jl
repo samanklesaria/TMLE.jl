@@ -97,8 +97,9 @@ end
     C = TMLE.ConditionalDistribution(:ΔY , [:W])
     η = TMLE.CMRelevantFactors(outcome_mean=Q, propensity_score=G, censoring_score=C)
     # Estimator
+    # IPCW weights the outcome model's loss, hence a learner supporting sample weights for :Y
     models = Dict(
-        :Y  => with_encoder(LinearRegressor()), 
+        :Y  => with_encoder(TMLE.LinearRegressor()), 
         :T₁ => LogisticClassifier(),
         :C_default => LogisticClassifier()
     )

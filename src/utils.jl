@@ -51,7 +51,6 @@ censoring_indicator_name(outcome::Symbol) = Symbol(:Δ_, outcome)
 has_missing_outcomes(dataset, outcome::Symbol) = ismissingtype(eltype(dataset[!, outcome]))
 
 function add_censoring_indicator(dataset, outcome::Symbol)
-    col = dataset[!, outcome]
     f(col) = categorical(ifelse.(ismissing.(col), 0, 1), ordered=true)
     DataFrames.transform(dataset, outcome => f => censoring_indicator_name(outcome))
 end
@@ -63,19 +62,6 @@ function compute_ipcw_weights(censoring_score, dataset; ps_lowerbound=1e-8)
     π = likelihood(censoring_score, dataset)
     truncate!(π, ps_lowerbound)
     return Δ ./ π
-end
-
-"""
-    counterfactual_censoring_covariate(censoring_score, dataset; ps_lowerbound=1e-8)
-
-Censoring factor for the counterfactual censoring intervention `Δ=1`: `1/P(Δ=1 | parents)`.
-Unlike `compute_ipcw_weights` (which uses the observed `Δ`), this sets `Δ=1`, so it is the
-factor folded into the *counterfactual* clever covariate.
-"""
-function counterfactual_censoring_covariate(censoring_score, dataset; ps_lowerbound=1e-8)
-    π = expected_value(censoring_score, dataset)
-    truncate!(π, ps_lowerbound)
-    return 1 ./ π
 end
 
 function nomissing(dataset::DataFrame, colnames; disallowmissing=true, view=false, copycols=false)

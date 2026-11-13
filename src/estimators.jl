@@ -8,13 +8,17 @@ abstract type Estimator end
     model::MLJBase.Supervised
     train_validation_indices
     prevalence_weights::Union{Nothing, Vector{Float64}}
+    censoring_score
 end
 
-MLConditionalDistributionEstimator(models; train_validation_indices=nothing, prevalence_weights=nothing) = 
-    MLConditionalDistributionEstimator(models, train_validation_indices, prevalence_weights)
+MLConditionalDistributionEstimator(models; train_validation_indices=nothing, prevalence_weights=nothing, censoring_score=nothing) = 
+    MLConditionalDistributionEstimator(models, train_validation_indices, prevalence_weights, censoring_score)
 
-MLConditionalDistributionEstimator(models, train_validation_indices; prevalence_weights=nothing) = 
-    MLConditionalDistributionEstimator(models, train_validation_indices, prevalence_weights)
+MLConditionalDistributionEstimator(models, train_validation_indices; prevalence_weights=nothing, censoring_score=nothing) = 
+    MLConditionalDistributionEstimator(models, train_validation_indices, prevalence_weights, censoring_score)
+
+MLConditionalDistributionEstimator(models, train_validation_indices, prevalence_weights) = 
+    MLConditionalDistributionEstimator(models, train_validation_indices, prevalence_weights, nothing)
 
 marginal_model(y::CategoricalVector) = ConstantClassifier()
 
@@ -52,7 +56,7 @@ function fit_mlj_model(model, X, y; parents=names(X), cache=false, weights=nothi
             normalised_weights = (weights / sum(weights)) * length(weights)
             mach = machine(model, X, y, normalised_weights; cache=cache)
         else
-            throw(ArgumentError("The model $(model) does not support weights and cannot be used with prevalence."))
+            throw(ArgumentError("The model $(model) does not support weights and cannot be used with prevalence correction or with missing outcomes (IPCW)."))
         end
     end
     MLJBase.fit!(mach, verbosity=verbosity)
@@ -86,6 +90,30 @@ get_training_prevalence_weights(weights::AbstractVector, train_indices::Tuple) =
 get_training_prevalence_weights(weights::AbstractVector, train_indices::AbstractVector) = weights[train_indices]
 
 """
+    combine_censoring_weights(weights, censoring_score, dataset, fold_id=nothing)
+
+Under IPCW a nuisance model is fit on the uncensored rows only, so each of them stands in for
+`1/P(Δ=1|parents)` rows of the target population and must be weighted accordingly. This is on top
+of (not instead of) the `Δ/π` factor carried by the influence function.
+
+`dataset` holds the rows the model is about to be fit on, which are complete in the censoring
+parents (they are the outcome model's parents) even when the full dataset is not, hence predicting
+from the fold machine directly rather than through the out-of-fold `predict` of the estimate.
+"""
+combine_censoring_weights(weights, censoring_score::Nothing, dataset, fold_id=nothing) = weights
+
+function combine_censoring_weights(weights, censoring_score, dataset, fold_id=nothing)
+    mach = censoring_machine(censoring_score, fold_id)
+    π = expected_value(predict(mach, selectcols(dataset, censoring_score.estimand.parents)))
+    truncate!(π, 1e-8)
+    ipcw = 1 ./ π
+    return weights === nothing ? ipcw : weights .* ipcw
+end
+
+censoring_machine(censoring_score::MLConditionalDistribution, fold_id) = censoring_score.machine
+censoring_machine(censoring_score::SampleSplitMLConditionalDistribution, fold_id) = censoring_score.machines[fold_id]
+
+"""
     extra_fit_columns(model, estimand)
 
 Extra feature columns a model needs in `X` beyond `estimand.parents`. Empty by default; the
@@ -115,6 +143,7 @@ function (estimator::MLConditionalDistributionEstimator)(estimand, dataset;
     y = relevant_dataset[!, estimand.outcome]
     # If a prevalence weights are provided, we use it to fit the model
     weights = get_training_prevalence_weights(estimator.prevalence_weights, estimator.train_validation_indices)
+    weights = combine_censoring_weights(weights, estimator.censoring_score, relevant_dataset)
     
     mach = fit_mlj_model(estimator.model, X, y; 
         parents=estimand.parents, 
@@ -145,10 +174,14 @@ Estimates a conditional distribution (or regression) for each training set defin
     model::MLJBase.Supervised
     train_validation_indices
     prevalence_weights::Union{Nothing, Vector{Float64}}
+    censoring_score
 end
 
-SampleSplitMLConditionalDistributionEstimator(model, train_validation_indices; prevalence_weights=nothing) =
-    SampleSplitMLConditionalDistributionEstimator(model, train_validation_indices, prevalence_weights)
+SampleSplitMLConditionalDistributionEstimator(model, train_validation_indices; prevalence_weights=nothing, censoring_score=nothing) =
+    SampleSplitMLConditionalDistributionEstimator(model, train_validation_indices, prevalence_weights, censoring_score)
+
+SampleSplitMLConditionalDistributionEstimator(model, train_validation_indices, prevalence_weights) =
+    SampleSplitMLConditionalDistributionEstimator(model, train_validation_indices, prevalence_weights, nothing)
 
 function update_sample_split_machines_with_fold!(machines::Vector{Machine}, 
     estimator, 
@@ -173,6 +206,7 @@ function update_sample_split_machines_with_fold!(machines::Vector{Machine},
     else
         nothing
     end
+    weights = combine_censoring_weights(weights, estimator.censoring_score, train_dataset, fold_id)
     machines[fold_id] = fit_mlj_model(estimator.model, Xtrain, ytrain; 
         parents=estimand.parents, 
         cache=machine_cache,
@@ -244,11 +278,11 @@ function (estimator::SampleSplitMLConditionalDistributionEstimator)(estimand, da
     return estimate
 end
 
-ConditionalDistributionEstimator(model, train_validation_indices::Union{Nothing,Tuple}; prevalence_weights=nothing) =
-    MLConditionalDistributionEstimator(model, train_validation_indices, prevalence_weights)
+ConditionalDistributionEstimator(model, train_validation_indices::Union{Nothing,Tuple}; prevalence_weights=nothing, censoring_score=nothing) =
+    MLConditionalDistributionEstimator(model, train_validation_indices, prevalence_weights, censoring_score)
 
-ConditionalDistributionEstimator(model, train_validation_indices::AbstractVector; prevalence_weights=nothing) =
-    SampleSplitMLConditionalDistributionEstimator(model, train_validation_indices, prevalence_weights)
+ConditionalDistributionEstimator(model, train_validation_indices::AbstractVector; prevalence_weights=nothing, censoring_score=nothing) =
+    SampleSplitMLConditionalDistributionEstimator(model, train_validation_indices, prevalence_weights, censoring_score)
 
     
 #####################################################################

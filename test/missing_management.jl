@@ -52,7 +52,8 @@ end
         outcome=:Y, 
         treatment_values=(T=(case=1, control=0),),
         treatment_confounders=(T=[:W],))
-    models = Dict(:Y => with_encoder(LinearRegressor()),
+    # IPCW weights the outcome model's loss, so :Y needs a learner supporting sample weights
+    models = Dict(:Y => with_encoder(TMLE.LinearRegressor()),
         :T => with_encoder(LogisticClassifier(lambda=0)),
         Symbol("Δ_Y") => with_encoder(TMLE.LinearBinaryClassifier()))
     tmle = Tmle(models=models, machine_cache=true)
